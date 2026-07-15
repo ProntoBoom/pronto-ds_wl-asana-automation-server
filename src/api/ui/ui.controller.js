@@ -56,9 +56,18 @@ export async function getProjectsUI (req, res) {
 export async function lookupProjectUI (req, res) {
   try {
     const { gid } = req.params
-    const registered = new Set(WebhookRepository.findAll().map(w => w.resourceId))
-    if (registered.has(gid)) {
-      return res.status(409).json({ message: 'This project already has a webhook registered.' })
+    const existing = WebhookRepository.findByGid(gid)
+    if (existing) {
+      // Don't trust the local record blindly — verify the webhook still
+      // exists in Asana. If it's gone (a stale "ghost" record), self-heal
+      // by dropping the record so the project can be registered again.
+      const { data: asanaWebhooks } = await getWebhooks()
+      const stillLive = asanaWebhooks.some(w => w.gid === existing.webhookId)
+      if (stillLive) {
+        return res.status(409).json({ message: 'This project already has a webhook registered.' })
+      }
+      console.warn(`Removing stale webhook record for project ${gid} (webhook ${existing.webhookId} no longer exists in Asana)`)
+      WebhookRepository.delete({ _id: existing._id })
     }
     const result = await getProjectById(gid)
     const { gid: projectGid, name } = result.data

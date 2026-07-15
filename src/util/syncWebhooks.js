@@ -4,7 +4,7 @@ import { WebhookRepository } from '../schemas/db-local/webhooks.js'
 export async function syncWebhooksFromAsana () {
   try {
     const { data: asanaWebhooks } = await getWebhooks()
-    let synced = 0
+    const recovered = []
 
     for (const webhook of asanaWebhooks) {
       // Target URL format: <host>/api/webhook/<path-segment>/<resource-gid>
@@ -19,12 +19,18 @@ export async function syncWebhooksFromAsana () {
           webhookId: webhook.gid,
           resourceType: webhook.resource.resource_type
         })
-        synced++
+        recovered.push(webhook.resource.gid)
       }
     }
 
-    if (synced > 0) {
-      console.log(`Recovered ${synced} webhook(s) from Asana into local DB`)
+    if (recovered.length > 0) {
+      // Recovered records have NO handshake secret — Asana only sends the
+      // secret once, at webhook creation. Incoming events for these will
+      // fail verification until the project is deleted and re-registered.
+      console.warn(
+        `Recovered ${recovered.length} webhook(s) from Asana WITHOUT handshake secrets — ` +
+        `signature verification will fail for these until they are re-registered: ${recovered.join(', ')}`
+      )
     }
   } catch (error) {
     console.error('Failed to sync webhooks from Asana on startup:', error.message)

@@ -384,6 +384,11 @@
 
   async function apiFetch (url, opts = {}) {
     const res = await fetch(url, opts)
+    if (res.status === 401) {
+      // Session expired — go to login instead of rendering a dead page
+      window.location.href = '/login'
+      throw new Error('Session expired')
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
       throw new Error(body.message || `Error ${res.status}`)

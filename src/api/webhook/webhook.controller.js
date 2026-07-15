@@ -49,6 +49,7 @@ export async function createWebhookHandler (req, res) {
     if (!webhookId || !resourceType) {
       WebhookRepository.delete({ _id: webhookUUID })
       res.status(500).json({ message: 'Invalid response' })
+      return
     }
 
     WebhookRepository.update(webhookUUID, { webhookId, resourceType })
@@ -74,6 +75,12 @@ export async function webhookFRTHandler (req, res) {
       '/first-response-time'
     )
 
+    if (!webhook) {
+      console.warn(`No webhook record for resource ${gid} — cannot verify event. Sent 404`)
+      res.sendStatus(404)
+      return
+    }
+
     // Handle webhook secret handshake when creating a webhook
     if (req.headers['x-hook-secret']) {
       const secret = req.headers['x-hook-secret']
@@ -91,7 +98,13 @@ export async function webhookFRTHandler (req, res) {
 
     const { events } = body
     const storyParentId = events[0]?.parent?.gid || null
-    const secretFRT = WebhookRepository.findById(webhook._id).secret
+    const secretFRT = WebhookRepository.findById(webhook._id)?.secret
+
+    if (!secretFRT) {
+      console.warn(`Webhook record for resource ${gid} has no secret (recovered without handshake?) — cannot verify. Sent 401`)
+      res.sendStatus(401)
+      return
+    }
 
     // Verify the signature of the webhook when an event is sent
 
@@ -113,6 +126,9 @@ export async function webhookFRTHandler (req, res) {
     await handleFirstResponseTime(storyParentId, createdAt)
   } catch (error) {
     console.error('Error in webhookHandler:', error)
+    // Always answer Asana — an unanswered request counts as a failed
+    // delivery and enough of those get the webhook deactivated
+    if (!res.headersSent) res.sendStatus(500)
   }
 }
 
