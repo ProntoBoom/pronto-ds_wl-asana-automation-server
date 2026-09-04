@@ -8,6 +8,49 @@ import { containsUrgentKeyword } from '../../util/urgentKeyword.js'
 import { describeAsanaError, formatAsanaError } from '../../util/asanaError.js'
 import { logEvent } from '../../util/eventLog.js'
 
+// A project's own Asana Rules (e.g. "when task added to board, set Priority
+// to Normal") react to the same events we do, and there's no guaranteed
+// ordering between an external webhook delivery and Asana's internal rule
+// engine — observed in practice taking up to ~60-90s to land. Rather than
+// relying on winning that race, re-check once after a delay and re-apply if
+// something else reset it. Deliberately a single, bounded recheck (not a
+// recurring enforcement loop) so a person manually retriaging the task later
+// isn't fought.
+const URGENT_PRIORITY_RECHECK_DELAY_MS = Number(process.env.URGENT_PRIORITY_RECHECK_DELAY_MS) || 90_000
+
+function scheduleUrgentPriorityRecheck (taskId, gid) {
+  setTimeout(async () => {
+    try {
+      const taskData = (await getTask(taskId)).data
+      if (checkIfUrgentPrioritySet(taskData)) return
+
+      await updateTask(
+        taskId,
+        process.env.PRIORITY_CUSTOM_FIELD_GID,
+        process.env.URGENT_ENUM_PRIORITY_GID
+      )
+
+      console.log(`Priority was reset after urgent-keyword match — re-applied Urgent on task ${taskId}`)
+      logEvent({
+        event: 'urgent.reapplied',
+        projectGid: gid,
+        taskGid: taskId,
+        message: `Priority was reset (likely by another Asana rule) — re-applied Urgent after ${URGENT_PRIORITY_RECHECK_DELAY_MS / 1000}s`
+      })
+    } catch (error) {
+      console.error(`Error re-checking urgent priority on task ${taskId}:`, formatAsanaError(error))
+      logEvent({
+        level: 'error',
+        event: 'urgent.recheck_failed',
+        projectGid: gid,
+        taskGid: taskId,
+        message: 'Unhandled error while re-checking urgent priority',
+        detail: describeAsanaError(error)
+      })
+    }
+  }, URGENT_PRIORITY_RECHECK_DELAY_MS)
+}
+
 export async function getWebhooksHandler (req, res) {
   try {
     const dbData = WebhookRepository.findAll()
@@ -326,6 +369,8 @@ export async function webhookURHandler (req, res) {
       taskGid: taskId,
       message: 'Urgent keyword detected — priority set to Urgent'
     })
+
+    scheduleUrgentPriorityRecheck(taskId, gid)
   } catch (error) {
     console.error('Error in webhookHandler:', formatAsanaError(error))
     logEvent({
