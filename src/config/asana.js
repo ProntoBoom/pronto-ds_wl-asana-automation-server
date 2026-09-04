@@ -112,7 +112,7 @@ const deleteWebhook = async (webhookId) => {
 // TASKS
 
 const getTask = async (taskId) => {
-  const opts = { opt_fields: 'gid,name,notes,created_at,parent,parent.gid,custom_fields,custom_fields.gid,custom_fields.number_value' }
+  const opts = { opt_fields: 'gid,name,notes,created_at,parent,parent.gid,custom_fields,custom_fields.gid,custom_fields.number_value,custom_fields.display_value' }
   const result = await asanaTaskInstance.getTask(taskId, opts)
 
   return result
