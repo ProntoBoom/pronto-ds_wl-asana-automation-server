@@ -19,7 +19,6 @@ const KEYWORDS = [
   'website down',
   'site down',
   'time sensitive',
-  'not working',
   'payment issue',
   'homepage broken',
   'broken layout',
