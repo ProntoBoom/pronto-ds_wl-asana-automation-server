@@ -1,22 +1,28 @@
 // One-off script: registers ONLY the urgent-keyword webhook for a project
 // that predates the urgent-keyword feature (already has FRT registered).
 //
-// Deliberately does NOT go through the UI's "Register" flow — that flow
-// re-creates the FRT webhook too, which would either fail (Asana rejects a
-// duplicate webhook for the same resource+target) or, worse, succeed and
-// leave two FRT webhooks firing on every comment. This only touches
-// /urgent-request.
+// This calls the app's OWN running HTTP API (POST /api/webhook/) instead of
+// writing to the local DB directly. That's essential, not a style choice:
+// db-local loads its JSON file into memory once at process startup and
+// never re-reads it on its own. A separate `node scripts/...` process
+// writing a new webhook record straight to disk would be invisible to the
+// already-running server — so when Asana immediately sends its handshake
+// request back to confirm the webhook, the live server would look up the
+// record in its own (stale) in-memory copy, find nothing, and reject the
+// handshake with a 404, causing the whole registration to fail.
 //
-// Run from the app root, once per project that needs it:
+// Going through the real endpoint sidesteps that entirely: the
+// ALREADY-RUNNING process handles the DB write, the Asana API call, and the
+// handshake itself, all in the same memory space — exactly like the UI's
+// "Register" flow does. The endpoint (createWebhookHandler, path
+// '/urgent-request') only touches the urgent-keyword webhook, and safely
+// no-ops (HTTP 500, nothing created) if one is already registered for this
+// project, since WebhookRepository.create() throws on a duplicate
+// resourceId+path before any Asana call is made.
+//
+// Run from the Web process terminal, once per project that needs it (uses
+// HOST and API_KEY from the live environment):
 //   node scripts/add-urgent-webhook.js <projectGid>
-//
-// On production (Kinsta), run this from the Web process terminal. No
-// redeploy/restart needed afterward — this calls the live Asana API and
-// writes the webhook record immediately; the running process doesn't need
-// to reload anything to start receiving events for the new webhook.
-
-import { WebhookRepository } from '../src/schemas/db-local/webhooks.js'
-import { createURWebhook, asanaConfig } from '../src/config/asana.js'
 
 const gid = process.argv[2]
 
@@ -25,26 +31,26 @@ if (!gid) {
   process.exit(1)
 }
 
-asanaConfig()
+const host = process.env.HOST
+const apiKey = process.env.API_KEY
 
-const existing = WebhookRepository.findByGidAndPath(gid, '/urgent-request')
-if (existing) {
-  console.log(`Project ${gid} already has an urgent-request webhook registered (id: ${existing._id}). Nothing to do.`)
-  process.exit(0)
+if (!host || !apiKey) {
+  console.error('HOST and API_KEY must be set in the environment to run this script.')
+  process.exit(1)
 }
 
-let webhookUUID
-try {
-  webhookUUID = WebhookRepository.create({ path: '/urgent-request', resourceId: gid })
+const response = await fetch(`${host}/api/webhook/`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey
+  },
+  body: JSON.stringify({ path: '/urgent-request', gid })
+})
 
-  const response = await createURWebhook(gid)
-  const { gid: webhookId, resource: { resource_type: resourceType, name: resourceName } } = response.data
-
-  WebhookRepository.update(webhookUUID, { webhookId, resourceType })
-
-  console.log(`Urgent Keyword webhook registered for project "${resourceName ?? gid}" (${gid})`)
-} catch (error) {
-  if (webhookUUID) WebhookRepository.delete({ _id: webhookUUID })
-  console.error(`Failed to register urgent-keyword webhook for project ${gid}:`, error.message)
+if (response.ok) {
+  console.log(`Urgent Keyword webhook registered for project ${gid}`)
+} else {
+  console.error(`Failed to register urgent-keyword webhook for project ${gid}: HTTP ${response.status} (this project may already have one registered)`)
   process.exit(1)
 }
