@@ -2,7 +2,7 @@ import { WebhookRepository } from '../../schemas/db-local/webhooks.js'
 import { KeywordsRepository } from '../../schemas/db-local/keywords.js'
 import { verifySignature } from '../../util/crypto.js'
 import { handleFirstResponseTime, verifyStoryFRT } from './webhook.service.js'
-import { getWebhooks, createFRTWebhook, createTICWebhook, createURWebhook, deleteWebhook, getTask, getStory, updateTask } from '../../config/asana.js'
+import { getWebhooks, createFRTWebhook, createTICWebhook, createURWebhook, deleteWebhook, getTask, getStory, updateTask, getCustomFieldChangeStories } from '../../config/asana.js'
 import { buildFinalResponse, checkIfUrgentPrioritySet } from './utils.js'
 import { containsUrgentKeyword } from '../../util/urgentKeyword.js'
 import { describeAsanaError, formatAsanaError } from '../../util/asanaError.js'
@@ -24,12 +24,53 @@ const URGENT_PRIORITY_RECHECK_DELAYS_MS = process.env.URGENT_PRIORITY_RECHECK_DE
   ? process.env.URGENT_PRIORITY_RECHECK_DELAYS_MS.split(',').map(s => Number(s.trim())).filter(Boolean)
   : DEFAULT_RECHECK_DELAYS_MS
 
+// Pending rechecks per task, so a person's override can cancel the rest and a
+// repeat match doesn't stack a second set of timers on the same task.
+const pendingRechecks = new Map()
+
+function cancelUrgentPriorityRecheck (taskId) {
+  for (const timer of pendingRechecks.get(taskId) ?? []) clearTimeout(timer)
+  pendingRechecks.delete(taskId)
+}
+
+/**
+ * The story for the most recent Priority change, if a person made it. We only
+ * get here once Priority is no longer Urgent, so that change wasn't ours — it
+ * was either an Asana Rule or a teammate retriaging the task, and the teammate
+ * must win. created_by can't tell them apart (a rule's story is credited to
+ * whoever triggered the rule), but the text can: rule stories always read
+ * "Asana changed …", a person's read "<their name> changed …".
+ */
+async function findHumanPriorityOverride (taskId) {
+  const changes = await getCustomFieldChangeStories(taskId, process.env.PRIORITY_CUSTOM_FIELD_GID)
+  const lastChange = changes.at(-1)
+
+  if (!lastChange || lastChange.text?.startsWith('Asana ')) return null
+  return lastChange
+}
+
 function scheduleUrgentPriorityRecheck (taskId, gid) {
-  for (const delayMs of URGENT_PRIORITY_RECHECK_DELAYS_MS) {
+  cancelUrgentPriorityRecheck(taskId)
+
+  const timers = URGENT_PRIORITY_RECHECK_DELAYS_MS.map(delayMs =>
     setTimeout(async () => {
       try {
         const taskData = (await getTask(taskId)).data
         if (checkIfUrgentPrioritySet(taskData)) return
+
+        const override = await findHumanPriorityOverride(taskId)
+        if (override) {
+          cancelUrgentPriorityRecheck(taskId)
+          console.log(`Priority on task ${taskId} was changed manually ("${override.text}") — leaving it as set`)
+          logEvent({
+            event: 'urgent.overridden',
+            projectGid: gid,
+            taskGid: taskId,
+            message: `Priority was changed manually after urgent-keyword match — not re-applying Urgent (checked at ${delayMs / 1000}s)`,
+            detail: { story: override.text, changedBy: override.created_by?.gid ?? null }
+          })
+          return
+        }
 
         await updateTask(
           taskId,
@@ -56,7 +97,14 @@ function scheduleUrgentPriorityRecheck (taskId, gid) {
         })
       }
     }, delayMs)
-  }
+  )
+
+  pendingRechecks.set(taskId, timers)
+  // Drop the entry once the last recheck has run.
+  const finalTimer = setTimeout(() => {
+    if (pendingRechecks.get(taskId) === timers) pendingRechecks.delete(taskId)
+  }, Math.max(...URGENT_PRIORITY_RECHECK_DELAYS_MS) + 1000)
+  timers.push(finalTimer)
 }
 
 export async function getWebhooksHandler (req, res) {

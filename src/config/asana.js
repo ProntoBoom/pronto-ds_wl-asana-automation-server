@@ -135,6 +135,24 @@ const getStoriesFromTask = async (taskId) => {
   return results
 }
 
+// Only the history entries recording a change to one enum custom field, oldest
+// first, with who made each change.
+const getCustomFieldChangeStories = async (taskId, customFieldId) => {
+  const opts = { opt_fields: 'resource_subtype,text,created_at,created_by.gid,custom_field.gid', limit: 100 }
+  const stories = []
+
+  let result = await asanaStoriesInstance.getStoriesForTask(taskId, opts)
+  while (true) {
+    stories.push(...(result.data ?? []))
+    if (!result.next_page?.offset) break
+    result = await asanaStoriesInstance.getStoriesForTask(taskId, { ...opts, offset: result.next_page.offset })
+  }
+
+  return stories.filter(s =>
+    s.resource_subtype === 'enum_custom_field_changed' && s.custom_field?.gid === customFieldId
+  )
+}
+
 const getStory = async (storyId) => {
   const opts = {}
   const results = await asanaStoriesInstance.getStory(storyId, opts)
@@ -271,6 +289,7 @@ export {
   deleteWebhook,
   getTask,
   getStoriesFromTask,
+  getCustomFieldChangeStories,
   getStory,
   getUsersInATeam,
   updateTask,
