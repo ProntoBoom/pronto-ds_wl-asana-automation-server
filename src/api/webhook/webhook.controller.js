@@ -34,23 +34,32 @@ function cancelUrgentPriorityRecheck (taskId) {
 }
 
 /**
- * The story for the most recent Priority change, if a person made it. We only
- * get here once Priority is no longer Urgent, so that change wasn't ours — it
- * was either an Asana Rule or a teammate retriaging the task, and the teammate
- * must win. created_by can't tell them apart (a rule's story is credited to
- * whoever triggered the rule), but the text can: rule stories always read
- * "Asana changed …", a person's read "<their name> changed …".
+ * Whether an Asana Rule reset Priority after we last set it to Urgent. We only
+ * get here once Priority is no longer Urgent: either a rule reset it (undo
+ * that) or a teammate retriaged the task (leave it). Only re-apply on positive
+ * evidence of a rule, because a person's change can leave no story at all —
+ * Asana merges rapid edits to one field by the same account, and the PAT owner
+ * editing a task the automation just touched collapses to nothing.
+ *
+ * created_by can't identify a rule either (its story is credited to whoever
+ * triggered the rule), but the text can: rule stories read "Asana changed …".
  */
-async function findHumanPriorityOverride (taskId) {
+async function getPriorityChangeAfter (taskId, since) {
   const changes = await getCustomFieldChangeStories(taskId, process.env.PRIORITY_CUSTOM_FIELD_GID)
   const lastChange = changes.at(-1)
 
-  if (!lastChange || lastChange.text?.startsWith('Asana ')) return null
+  if (!lastChange || new Date(lastChange.created_at).getTime() < since) return null
   return lastChange
 }
 
-function scheduleUrgentPriorityRecheck (taskId, gid) {
+const isRuleStory = (story) => story?.text?.startsWith('Asana ') ?? false
+
+function scheduleUrgentPriorityRecheck (taskId, gid, urgentSetAt) {
   cancelUrgentPriorityRecheck(taskId)
+
+  // Moves forward each time we re-apply, so a rule story we've already
+  // answered isn't mistaken for a fresh reset.
+  let lastSetAt = urgentSetAt
 
   const timers = URGENT_PRIORITY_RECHECK_DELAYS_MS.map(delayMs =>
     setTimeout(async () => {
@@ -58,20 +67,21 @@ function scheduleUrgentPriorityRecheck (taskId, gid) {
         const taskData = (await getTask(taskId)).data
         if (checkIfUrgentPrioritySet(taskData)) return
 
-        const override = await findHumanPriorityOverride(taskId)
-        if (override) {
+        const change = await getPriorityChangeAfter(taskId, lastSetAt)
+        if (!isRuleStory(change)) {
           cancelUrgentPriorityRecheck(taskId)
-          console.log(`Priority on task ${taskId} was changed manually ("${override.text}") — leaving it as set`)
+          console.log(`Priority on task ${taskId} was changed, not by an Asana Rule — leaving it as set`)
           logEvent({
             event: 'urgent.overridden',
             projectGid: gid,
             taskGid: taskId,
             message: `Priority was changed manually after urgent-keyword match — not re-applying Urgent (checked at ${delayMs / 1000}s)`,
-            detail: { story: override.text, changedBy: override.created_by?.gid ?? null }
+            detail: { story: change?.text ?? null, changedBy: change?.created_by?.gid ?? null }
           })
           return
         }
 
+        lastSetAt = Date.now()
         await updateTask(
           taskId,
           process.env.PRIORITY_CUSTOM_FIELD_GID,
@@ -412,6 +422,7 @@ export async function webhookURHandler (req, res) {
 
     if (!isUrgentWordDetected) return
 
+    const urgentSetAt = Date.now()
     await updateTask(
       taskId,
       process.env.PRIORITY_CUSTOM_FIELD_GID,
@@ -426,7 +437,7 @@ export async function webhookURHandler (req, res) {
       message: 'Urgent keyword detected — priority set to Urgent'
     })
 
-    scheduleUrgentPriorityRecheck(taskId, gid)
+    scheduleUrgentPriorityRecheck(taskId, gid, urgentSetAt)
   } catch (error) {
     console.error('Error in webhookHandler:', formatAsanaError(error))
     logEvent({
